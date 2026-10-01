@@ -1,224 +1,108 @@
 # cf-webproxy
 
-这是一个基于 **Cloudflare Workers** 的 Telegram Android 官方 **WEB Proxy** 实现。它不需要 VPS、原版 MTProxy 进程或其他代理后端。
+基于 **Cloudflare Workers + Durable Objects** 的 Telegram WEB Proxy 独立实现。在 Worker 内完成 MTProxy 混淆流转换并直连 Telegram 数据中心，**不需要 VPS、后端 MTProxy 或管理面板**。
 
 ```text
-Telegram Android
-  → HTTPS / WebSocket WEB 载体
-  → Cloudflare Worker + Durable Object
-  → 在 Worker 内终止并转换 MTProxy 混淆流
-  → 通过 cloudflare:sockets 直接连接 Telegram DC:443
+Telegram Android → HTTPS / WebSocket → Worker + Durable Object → Telegram DC:443
 ```
 
-## 功能特性
-
-- 实现 Telegram 官方 WEB Proxy Bridge（`TelegramWebProxy` Android Bridge）
-- 实现二进制载体帧和 WebSocket 多路复用
-- 使用 Durable Object 管理代理会话
-- 不同逻辑连接独立排队，同一连接保持严格顺序，避免慢连接拖住整个会话
-- 有界上行队列、下行流控与背压，限制缓冲字节数和条目数
-- 握手、TCP 建连和写入超时，关闭时取消正在建立的连接
-- 在 Worker 内解析 MTProxy 64 字节混淆握手
-- 双向、带状态的 AES-256-CTR 流转换
-- 根据握手中的 DC ID 直接连接 Telegram DC 1–5
-- 支持以下传输协议标签：
-  - Abridged
-  - Intermediate
-  - Secure Intermediate
-- 支持普通 16 字节 Secret 和带 `dd` 前缀的 Secret
-- 包含连接数、流量窗口及握手合法性检查
-
-> Telegram WEB Proxy 模式不支持 FakeTLS，因此本项目不支持以 `ee` 开头的 Secret。
-
-## 工作原理
-
-Telegram Android 客户端首先通过 HTTPS 打开 Worker 提供的 Bridge 页面，然后通过 WebSocket 建立 WEB Proxy 载体连接。
-
-每个逻辑连接都会在 Worker 内完成以下操作：
-
-1. 接收客户端发送的 MTProxy 混淆握手。
-2. 使用配置的 `PROXY_SECRET` 验证并解密握手。
-3. 从握手中读取传输协议和 Telegram DC ID。
-4. 通过 `cloudflare:sockets` 连接对应 Telegram DC 的 TCP 443 端口。
-5. 为 Telegram DC 创建新的混淆握手。
-6. 在客户端加密流和 Telegram DC 加密流之间进行双向实时转换。
-
-项目没有 `UPSTREAM_HOST` 或 `UPSTREAM_PORT` 配置，也不会连接用户指定的任意目标。通过验证的连接只能访问代码内预设的 Telegram DC 地址和 TCP 443 端口。
+支持 WebSocket 多路复用、连接内保序、独立队列、流控与超时清理。仅连接代码内预设的 Telegram DC，不接受任意 TCP 目标。
 
 ## 部署到 Cloudflare
 
-本项目是 **Cloudflare Worker**，不是 Cloudflare Pages 项目。最简单的部署方式是点击下面的一键部署按钮。
+> 本项目是 **Worker，不是 Pages**。仓库已包含入口、Durable Object 绑定及迁移配置，不需要填写 `dist` 输出目录。
 
 ### 方法一：一键部署（推荐）
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/coldboy404/cf-webproxy)
 
-点击按钮后按以下步骤操作：
+1. 点击按钮，登录 Cloudflare，按提示连接 GitHub 并创建仓库。
+2. 保留默认 Worker 名称，或自行修改。
+3. 按提示填写 `PROXY_SECRET`，确认部署。所需 Durable Object 会自动创建。
+4. 部署完成后，记录 Worker 的 `*.workers.dev` 地址。
 
-1. 登录你的 Cloudflare 账户。
-2. 如果页面要求连接 GitHub，请授权 Cloudflare 访问 GitHub。
-3. Cloudflare 会把本项目复制到你的 GitHub 账户，并自动识别 `wrangler.toml`。
-4. Worker 名称可以保持默认，也可以改成你喜欢的名称，例如 `tg-webproxy`。
-5. 在 Secret 配置页面填写：
-   - `PROXY_SECRET`：32 位小写十六进制字符串；也可以是 `dd` 加 32 位十六进制字符串。
-6. 确认部署。Cloudflare 会自动创建并绑定项目需要的 Durable Object。
-7. 部署完成后，Cloudflare 会提供类似下面的地址：
+**如果部署页面未要求填写 Secret**，进入：
 
 ```text
-https://tg-webproxy.你的账户名.workers.dev
+Workers & Pages → 选择 Worker → Settings → Variables and Secrets → Add
 ```
 
-如果一键部署页面没有要求填写 Secret，请在部署完成后进入：
+添加名称为 `PROXY_SECRET` 的 **Secret（机密），不要使用普通明文变量**。值必须是 **32 位小写十六进制字符串**，也支持 `dd` 加 32 位小写十六进制字符串；不支持 `ee` / FakeTLS。请使用自己的密钥，不要照抄示例。
 
-```text
-Cloudflare 控制台
-→ Workers & Pages
-→ 选择刚部署的 Worker
-→ Settings（设置）
-→ Variables and Secrets（变量和机密）
-→ Add（添加）
-```
+保存并按控制台提示部署，使配置生效。
 
-添加下面这个 **Secret**，不要添加成普通明文变量：
+### 方法二：导入 GitHub 仓库
 
-| 名称 | 示例格式 |
-|---|---|
-| `PROXY_SECRET` | `0123456789abcdef0123456789abcdef` |
+1. Fork 本仓库。
+2. 在 Cloudflare 的 **Workers & Pages → Create application → Import a repository** 中选择 Fork 后的仓库。
+3. 使用以下配置：
 
-保存后，在 Worker 的 **Deployments（部署）** 页面重新部署一次，使 Secret 生效。
-
-### 如何生成 Secret
-
-Linux、macOS、Git Bash 或装有 OpenSSL 的 Windows：
-
-```bash
-# 生成 PROXY_SECRET
-openssl rand -hex 16
-
-```
-
-没有 OpenSSL 时，可以在浏览器开发者工具的 Console 中执行：
-
-```js
-// PROXY_SECRET
-[...crypto.getRandomValues(new Uint8Array(16))]
-  .map(x => x.toString(16).padStart(2, "0")).join("")
-
-```
-
-如果希望使用 `dd` Secret，在生成的 32 位 `PROXY_SECRET` 前面加上 `dd`：
-
-```text
-dd0123456789abcdef0123456789abcdef
-```
-
-### 方法二：在 Cloudflare 控制台导入 GitHub 仓库
-
-如果不使用一键部署按钮，也可以手动导入：
-
-1. 打开 Cloudflare 控制台。
-2. 进入 **Workers & Pages**。
-3. 点击 **Create application（创建应用）**。
-4. 选择 **Import a repository（导入仓库）** 或连接 GitHub。
-5. 选择你 Fork 后的 `cf-webproxy` 仓库。
-6. 使用以下构建配置：
-
-| 配置 | 填写内容 |
+| 配置 | 值 |
 |---|---|
 | Production branch | `main` |
-| Build command | 留空或填写 `npm test` |
+| Build command | 留空或 `npm test` |
 | Deploy command | `npx wrangler deploy` |
 | Root directory | `/` |
 
-7. 保存并部署。
-8. 按上一节的方法，在 Worker 设置中添加 `PROXY_SECRET`。
-9. 添加 Secret 后重新部署。
+4. 保存并部署，再按上一节添加 `PROXY_SECRET` 并使其生效。
 
-仓库已经包含 `wrangler.toml`，其中声明了 Worker 入口和 Durable Object。不要把该项目当成 Pages 静态网站部署，也不需要填写 `dist` 输出目录。
+### 方法三：命令行部署
 
-### 方法三：使用 Wrangler 命令行部署
-
-要求：
-
-- Node.js 22.15+（推荐 Node.js 24 LTS）
-- npm
-- Cloudflare 账户
-
-克隆项目：
+需要 Node.js **22.15+（推荐 24 LTS）**、npm 和 Cloudflare 账户。
 
 ```bash
 git clone https://github.com/coldboy404/cf-webproxy.git
 cd cf-webproxy
-npm install
-```
-
-登录 Cloudflare：
-
-```bash
+npm ci
 npx wrangler login
-```
-
-设置两个 Secret：
-
-```bash
 npx wrangler secret put PROXY_SECRET
-```
-
-命令执行后，按照终端提示粘贴随机值。然后运行测试和部署：
-
-```bash
 npm test
 npx wrangler deploy
 ```
 
-部署成功后，终端会显示 Worker 地址，例如：
+运行 `secret put` 时按提示输入自己的密钥。部署成功后，终端会显示 Worker 地址。
 
-```text
-https://cf-webproxy.你的账户名.workers.dev
-```
+> Windows PowerShell 如果提示禁止执行 `npx.ps1`，将命令中的 `npx` 改为 `npx.cmd`；`npm` 也可使用 `npm.cmd`，无需修改系统执行策略。
 
 ### 绑定自定义域名（推荐）
 
-> 仓库的 `wrangler.toml` 不写死任何域名，以便 Fork 后可以在不同的 Cloudflare 账号部署。部署成功后，再在 Cloudflare 控制台绑定你自己的域名。不要把个人域名提交到公共 Fork 的 `[[routes]]`，否则其他账号部署时会出现 `Could not find zone`。
+如果 `workers.dev` 在你的网络中无法稳定访问，可绑定托管在 Cloudflare 的自定义域名：
 
-`workers.dev` 域名可以直接使用，但部分网络环境可能无法稳定访问，因此建议绑定一个托管在 Cloudflare 的自定义域名。
+1. 打开 **Worker → Settings → Domains & Routes → Add → Custom Domain**。
+2. 填写域名，例如 `proxy.example.com`，等待证书签发完成。
+3. 在 Telegram 中使用这个域名作为入口。
 
-1. 进入 Cloudflare 控制台中的 Worker。
-2. 打开 **Settings（设置）→ Domains & Routes（域和路由）**。
-3. 点击 **Add（添加）→ Custom Domain（自定义域）**。
-4. 填写域名，例如：
+**无需修改 `wrangler.toml`**：`PUBLIC_HOSTNAME` 默认留空，自动使用请求主机名。仅当需要限制入口域名时才填写它。不要将个人域名写入公共仓库的 `[[routes]]`，以免其他账号 Fork 后部署失败。
 
-```text
-proxy.example.com
-```
+## 添加到 Telegram
 
-5. 等待证书签发完成。
-6. 修改 `wrangler.toml`：
-
-```toml
-[vars]
-PUBLIC_HOSTNAME = "proxy.example.com"
-MAX_STREAMS = "64"
-SESSION_TTL_SECONDS = "300"
-```
-
-7. 提交修改触发自动部署，或者再次执行：
-
-```bash
-npx wrangler deploy
-```
-
-如果 `PUBLIC_HOSTNAME` 保持为空，Worker 会自动使用收到请求时的主机名。因此仅使用 `workers.dev` 地址时通常不需要修改它。
-
-### 验证部署是否成功
-
-在浏览器访问：
+在支持 WEB Proxy 的 Telegram Android 客户端打开：
 
 ```text
-https://你的 Worker 域名/healthz
+https://t.me/webproxy?server=proxy.example.com&secret=你的PROXY_SECRET
 ```
 
-正常情况下会返回：
+- 将 `proxy.example.com` 替换为你的 Worker 域名，**不要添加 `https://` 或路径**。
+- `secret` 必须与 Cloudflare 中的 `PROXY_SECRET` 完全一致，包括可选的 `dd` 前缀。
+- 配置后实际测试消息收发；浏览器能打开域名不代表代理一定可用。
+
+## 配置项
+
+正常使用只需要配置 `PROXY_SECRET`，其他项保持默认即可。
+
+| 名称 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `PROXY_SECRET` | Secret | 必填 | 32 位小写十六进制密钥，可加 `dd` 前缀。 |
+| `PUBLIC_HOSTNAME` | 环境变量 | 空 | 可选，限制入口主机名，不含协议或路径；为空时使用请求主机名。 |
+| `MAX_STREAMS` | 环境变量 | `64` | 每个会话允许的最大逻辑连接数。 |
+| `SESSION_TTL_SECONDS` | 环境变量 | `300` | Bootstrap 凭证有效期（秒），不是已建立连接的最长时长。 |
+| `DIAGNOSTICS` | 环境变量 | 关闭 | 临时设置为 `1` 开启连接诊断，排障后删除或设为 `0`。 |
+
+会话签名密钥由 `PROXY_SECRET` 域隔离派生，**不需要手填 `SESSION_SIGNING_KEY`**，也不会将派生密钥发给客户端。
+
+## 验证与排障
+
+访问 `https://你的域名/healthz`，正常返回：
 
 ```json
 {
@@ -228,164 +112,53 @@ https://你的 Worker 域名/healthz
 }
 ```
 
-如果能看到以上结果，说明 Worker HTTP 入口正常。这个健康检查不会验证 Durable Object 会话或 Telegram DC 的实际连通性，也不会暴露 Secret；最终请用 Telegram 客户端连接并测试消息收发。
+这只检查 Worker HTTP 入口，不验证 Durable Object 会话或 Telegram DC 连通性。根路径显示伪装页面是正常现象，只有通过 Bridge 鉴权的请求才会加载代理页面。
 
-### 更新项目
+**无法连接时，依次检查：**
 
-命令行部署的项目可以这样更新：
+1. `PROXY_SECRET` 是否已生效，是否与 Telegram 链接一致。
+2. 自定义域名是否绑定到正确的 Worker，证书是否就绪。
+3. 若设置了 `PUBLIC_HOSTNAME`，是否与实际入口域名一致。
+4. 临时开启 `DIAGNOSTICS=1`，查看 Worker 日志；不要公开 Secret、会话 Token 或完整 Bridge URL。
+
+**延迟不是域名 Ping**：Telegram 显示的延迟还包含 Worker / Durable Object 调度及到 Telegram DC 的链路耗时。连接稳定后再比较，并分别测试移动网络和宽带；代码优化无法保证所有网络都降到同一延迟。
+
+## 更新项目
+
+- **GitHub 自动部署**：Fork 用户先同步上游；已连接 Workers Builds 的生产分支更新后会触发部署。
+- **命令行部署**：
 
 ```bash
 git pull
-npm install
+npm ci
 npm test
 npx wrangler deploy
 ```
 
-通过一键部署或 GitHub 导入的项目，推送到生产分支后，Cloudflare Workers Builds 会自动重新部署。
-## 添加到 Telegram
-
-代理链接格式如下：
-
-```text
-https://t.me/webproxy?server=你的域名&secret=你的Secret
-```
-
-普通 Secret 示例：
-
-```text
-https://t.me/webproxy?server=proxy.example.com&secret=0123456789abcdef0123456789abcdef
-```
-
-`dd` Secret 示例：
-
-```text
-https://t.me/webproxy?server=proxy.example.com&secret=dd0123456789abcdef0123456789abcdef
-```
-
-注意事项：
-
-- `server` 中不要填写 `https://`。
-- `server` 应填写 Telegram 客户端可以访问的 Worker 自定义域名。
-- 链接中的 Secret 必须与 Cloudflare Worker 中设置的 `PROXY_SECRET` 完全一致。
-
-## Bridge 鉴权
-
-客户端和 Worker 会使用以下规则计算隐藏的 Bridge Capability：
-
-```text
-base64url(
-  HMAC-SHA256(
-    secret_bytes,
-    "tdesktop-web-proxy-bridge-v1\n" + lowercase_hostname
-  )
-)
-```
-
-普通访问者打开 Worker 根路径时只会看到伪装页面。只有携带正确 Bridge Capability 的请求才会加载代理 Bridge。
-
-## 配置项
-
-> 会话签名密钥由程序使用 `PROXY_SECRET` 进行域隔离派生，不需要额外配置 `SESSION_SIGNING_KEY`，也不会把派生密钥发送给客户端。
-
-| 名称 | 类型 | 默认值 | 说明 |
-|---|---|---:|---|
-| `PROXY_SECRET` | Worker Secret | 无 | 必填。32 位十六进制字符串，可添加 `dd` 前缀。 |
-| `PUBLIC_HOSTNAME` | 环境变量 | 空 | 对外使用的自定义域名，不包含协议。 |
-| `MAX_STREAMS` | 环境变量 | `64` | 每个会话允许的最大逻辑连接数。 |
-| `SESSION_TTL_SECONDS` | 环境变量 | `300` | Bridge Bootstrap 凭证的有效期，单位为秒。 |
-
-## 轻量优化与兼容性
-
-本项目保持 **单 WebSocket + Durable Object + 直连 Telegram DC**，不需要后端 MTProxy、管理面板或优选域名配置。现有部署不需要新增变量，也不需要新的 Durable Object migration。
-
-- **分连接 FIFO**：帧解析保持接收顺序，但每个 stream 独立处理 TCP 和加密；慢连接不会阻塞其他 stream 的写入或 WINDOW/CLOSE。
-- **有界缓冲**：入站待解析队列、上行待写队列和未被客户端 WINDOW 确认的下行 DATA 分别设置 8 MiB 总量上限，并计入帧头和条目开销。下行容量不足时暂停读取；单个 stream 上行超限时关闭该 stream。Bridge 建连期间最多缓存 2 MiB、1024 条消息。
-- **超时清理**：未完成的握手 15 秒、TCP 建连 10 秒、单次 TCP 写入 30 秒超时。关闭 stream 会丢弃其待写数据、取消等待，并关闭已建立或正在建立的 socket。
-- **安全收紧**：Bridge 使用随机 CSP nonce，只允许请求自己的 HTTPS/WSS 域名；Fetch 禁止跨域和重定向。会话 Token 带签名并绑定域名，随机或伪造凭证会在访问 Durable Object 前被拒绝。
-- **低开销诊断**：默认不构造逐帧日志。临时设置 `DIAGNOSTICS=1` 可查看不含 Secret/Token 的连接诊断和 TCP 建连耗时。
-
-更新部署后，请在 Telegram 中关闭再开启代理，让客户端重新创建 Bridge 和会话。旧会话凭证不保证跨版本有效。
-
-协议参考 Telegram 官方仓库 [telegramdesktop/tproxy-server](https://github.com/telegramdesktop/tproxy-server) 的 [PROTOCOL.md](https://github.com/telegramdesktop/tproxy-server/blob/master/PROTOCOL.md) 和 [ANDROID.md](https://github.com/telegramdesktop/tproxy-server/blob/master/ANDROID.md)。官方参考项目仍标注为概念验证，采用本地 MTProxy 后端；本项目是保留客户端载体协议、在 Worker 内完成 MTProxy 转换的独立实现，不是官方 Cloudflare 部署方案，也未实现全部载体模式。
-
-## 延迟说明
-
-Telegram 显示的延迟不只是域名 Ping，还包含客户端到 Cloudflare、Worker/Durable Object 调度以及 Cloudflare 到 Telegram 数据中心的链路耗时。不同域名即使都使用 Cloudflare，也可能因运营商路由、接入节点、账号所在 Telegram DC 和冷启动状态产生明显差异。
-
-建议连续观察几次稳定连接后的延迟，不要只看首次连接。项目默认关闭逐帧诊断日志，且跳过逐帧日志数据构造，减少不必要的 CPU 开销；临时排障时可在 Worker 环境变量中设置 `DIAGNOSTICS=1`，排障结束后删除或设为 `0`。
-
-可优先尝试：
-
-- 使用在本地网络路由更好的 Cloudflare 自定义域名；
-- 避免同时开启会改写路由的 VPN、分流或私有 DNS；
-- 分别用移动网络和宽带测试，判断是否为运营商到 Cloudflare 的路由问题；
-- 等连接稳定后再比较延迟，首次连接包含 Session、WebSocket 和 TCP 建连成本。
-
-## 健康检查
-
-部署后可以访问：
-
-```text
-https://你的域名/healthz
-```
-
-正常情况下会返回类似内容：
-
-```json
-{
-  "ok": true,
-  "carrier": "websocket",
-  "relay": "direct-telegram-dc"
-}
-```
-
-这里仅检查 Worker HTTP 入口是否正常，不会实际拨号验证 Telegram DC，也不代表 Telegram 客户端一定能连接。
+更新成功后，在 Telegram 中关闭再开启代理，重建 Bridge 和会话。
 
 ## 本地开发
-
-建议使用 Node.js 22.15+（或 Node.js 24 LTS）。安装依赖并运行测试：
 
 ```bash
 npm ci
 npm test
+npx wrangler dev
 ```
 
-检查生产构建但不部署：
+仅检查构建、不部署：
 
 ```bash
 npx wrangler deploy --dry-run --outdir .wrangler-dry-run
 ```
 
-测试覆盖帧合法性、分连接并行/连接内顺序、Blob 消息、队列限额、流控、真实 AES-CTR 双向转换、拨号取消/超时和 Bridge 生命周期。测试使用模拟 TCP/WebView，不能代替 Telegram 真机及 Cloudflare 生产网络验证。
+测试覆盖帧校验、连接内顺序、队列限额、流控、AES-CTR 转换及连接生命周期。模拟测试不能替代 Telegram 真机和 Cloudflare 生产网络验证。
 
-启动 Wrangler 本地开发服务器：
+## 协议与安全
 
-```bash
-npx wrangler dev
-```
-
-本地测试真实 TCP 连接时，需要注意 Wrangler 本地运行环境与 Cloudflare 生产网络之间可能存在差异。
-
-## 安全说明
-
-- 不要提交 `.dev.vars`、Secret、会话 Token 或带 Bridge Capability 的完整 URL。
-- Worker 不接受客户端指定的 TCP 目标，只允许连接内置的 Telegram DC 地址。
-- Cloudflare Workers 的 TCP 出站能力、连接数量和运行时限制可能因套餐及地区而异。
-- Cloudflare 或 Telegram 流量受限制的网络环境中，本项目无法保证代理可用性。
-- 使用本项目时，请遵守所在地法律法规及 Cloudflare、Telegram 的服务条款。
-
-## 项目结构
-
-```text
-src/index.js       HTTP 路由、鉴权和 Durable Object 入口
-src/session.js     分连接队列、TCP 转发、流控及会话生命周期
-src/bridge.js      Android / Loopback Bridge 页面
-src/protocol.js    帧格式、编解码与协议常量
-src/mtproxy.js     MTProxy 握手、AES-CTR 转换和 Telegram DC 路由
-test/              单元测试
-wrangler.toml      Cloudflare Workers 配置
-```
+- 协议参考 Telegram 官方 [tproxy-server](https://github.com/telegramdesktop/tproxy-server) 的 [PROTOCOL.md](https://github.com/telegramdesktop/tproxy-server/blob/master/PROTOCOL.md) 和 [ANDROID.md](https://github.com/telegramdesktop/tproxy-server/blob/master/ANDROID.md)。本项目是独立实现，**不是官方 Cloudflare 部署方案**，也未实现全部载体模式。
+- 不要提交 `.dev.vars`、真实 Secret、会话 Token 或带鉴权信息的 URL。
+- 可用性受本地网络、Cloudflare TCP 出站限制及 Telegram 链路影响；使用时请遵守相关服务条款及所在地法律法规。
 
 ## 许可证
 
-本项目采用 [MIT License](./LICENSE)。
+[MIT License](./LICENSE)
