@@ -15,6 +15,9 @@ Telegram Android
 - 实现 Telegram 官方 WEB Proxy Bridge（`TelegramWebProxy` Android Bridge）
 - 实现二进制载体帧和 WebSocket 多路复用
 - 使用 Durable Object 管理代理会话
+- 不同逻辑连接独立排队，同一连接保持严格顺序，避免慢连接拖住整个会话
+- 有界上行队列、下行流控与背压，限制缓冲字节数和条目数
+- 握手、TCP 建连和写入超时，关闭时取消正在建立的连接
 - 在 Worker 内解析 MTProxy 64 字节混淆握手
 - 双向、带状态的 AES-256-CTR 流转换
 - 根据握手中的 DC ID 直接连接 Telegram DC 1–5
@@ -76,7 +79,7 @@ Cloudflare 控制台
 → Add（添加）
 ```
 
-添加下面两个 **Secret**，不要添加成普通明文变量：
+添加下面这个 **Secret**，不要添加成普通明文变量：
 
 | 名称 | 示例格式 |
 |---|---|
@@ -137,7 +140,7 @@ dd0123456789abcdef0123456789abcdef
 
 要求：
 
-- Node.js 20 或更高版本
+- Node.js 22.15+（推荐 Node.js 24 LTS）
 - npm
 - Cloudflare 账户
 
@@ -225,7 +228,7 @@ https://你的 Worker 域名/healthz
 }
 ```
 
-如果能看到以上结果，说明 Worker 和 Durable Object 已经成功部署。这个健康检查只验证 Worker 服务正常，不会暴露 Secret。
+如果能看到以上结果，说明 Worker HTTP 入口正常。这个健康检查不会验证 Durable Object 会话或 Telegram DC 的实际连通性，也不会暴露 Secret；最终请用 Telegram 客户端连接并测试消息收发。
 
 ### 更新项目
 
@@ -291,11 +294,25 @@ base64url(
 | `MAX_STREAMS` | 环境变量 | `64` | 每个会话允许的最大逻辑连接数。 |
 | `SESSION_TTL_SECONDS` | 环境变量 | `300` | Bridge Bootstrap 凭证的有效期，单位为秒。 |
 
+## 轻量优化与兼容性
+
+本项目保持 **单 WebSocket + Durable Object + 直连 Telegram DC**，不需要后端 MTProxy、管理面板或优选域名配置。现有部署不需要新增变量，也不需要新的 Durable Object migration。
+
+- **分连接 FIFO**：帧解析保持接收顺序，但每个 stream 独立处理 TCP 和加密；慢连接不会阻塞其他 stream 的写入或 WINDOW/CLOSE。
+- **有界缓冲**：入站待解析队列、上行待写队列和未被客户端 WINDOW 确认的下行 DATA 分别设置 8 MiB 总量上限，并计入帧头和条目开销。下行容量不足时暂停读取；单个 stream 上行超限时关闭该 stream。Bridge 建连期间最多缓存 2 MiB、1024 条消息。
+- **超时清理**：未完成的握手 15 秒、TCP 建连 10 秒、单次 TCP 写入 30 秒超时。关闭 stream 会丢弃其待写数据、取消等待，并关闭已建立或正在建立的 socket。
+- **安全收紧**：Bridge 使用随机 CSP nonce，只允许请求自己的 HTTPS/WSS 域名；Fetch 禁止跨域和重定向。会话 Token 带签名并绑定域名，随机或伪造凭证会在访问 Durable Object 前被拒绝。
+- **低开销诊断**：默认不构造逐帧日志。临时设置 `DIAGNOSTICS=1` 可查看不含 Secret/Token 的连接诊断和 TCP 建连耗时。
+
+更新部署后，请在 Telegram 中关闭再开启代理，让客户端重新创建 Bridge 和会话。旧会话凭证不保证跨版本有效。
+
+协议参考 Telegram 官方仓库 [telegramdesktop/tproxy-server](https://github.com/telegramdesktop/tproxy-server) 的 [PROTOCOL.md](https://github.com/telegramdesktop/tproxy-server/blob/master/PROTOCOL.md) 和 [ANDROID.md](https://github.com/telegramdesktop/tproxy-server/blob/master/ANDROID.md)。官方参考项目仍标注为概念验证，采用本地 MTProxy 后端；本项目是保留客户端载体协议、在 Worker 内完成 MTProxy 转换的独立实现，不是官方 Cloudflare 部署方案，也未实现全部载体模式。
+
 ## 延迟说明
 
 Telegram 显示的延迟不只是域名 Ping，还包含客户端到 Cloudflare、Worker/Durable Object 调度以及 Cloudflare 到 Telegram 数据中心的链路耗时。不同域名即使都使用 Cloudflare，也可能因运营商路由、接入节点、账号所在 Telegram DC 和冷启动状态产生明显差异。
 
-建议连续观察几次稳定连接后的延迟，不要只看首次连接。项目默认关闭逐帧诊断日志，避免日志序列化增加 CPU 开销；临时排障时可在 Worker 环境变量中设置 `DIAGNOSTICS=1`，排障结束后删除或设为 `0`。
+建议连续观察几次稳定连接后的延迟，不要只看首次连接。项目默认关闭逐帧诊断日志，且跳过逐帧日志数据构造，减少不必要的 CPU 开销；临时排障时可在 Worker 环境变量中设置 `DIAGNOSTICS=1`，排障结束后删除或设为 `0`。
 
 可优先尝试：
 
@@ -322,7 +339,24 @@ https://你的域名/healthz
 }
 ```
 
+这里仅检查 Worker HTTP 入口是否正常，不会实际拨号验证 Telegram DC，也不代表 Telegram 客户端一定能连接。
+
 ## 本地开发
+
+建议使用 Node.js 22.15+（或 Node.js 24 LTS）。安装依赖并运行测试：
+
+```bash
+npm ci
+npm test
+```
+
+检查生产构建但不部署：
+
+```bash
+npx wrangler deploy --dry-run --outdir .wrangler-dry-run
+```
+
+测试覆盖帧合法性、分连接并行/连接内顺序、Blob 消息、队列限额、流控、真实 AES-CTR 双向转换、拨号取消/超时和 Bridge 生命周期。测试使用模拟 TCP/WebView，不能代替 Telegram 真机及 Cloudflare 生产网络验证。
 
 启动 Wrangler 本地开发服务器：
 
@@ -343,7 +377,10 @@ npx wrangler dev
 ## 项目结构
 
 ```text
-src/index.js       WEB 载体、Bridge 页面、会话和 Durable Object
+src/index.js       HTTP 路由、鉴权和 Durable Object 入口
+src/session.js     分连接队列、TCP 转发、流控及会话生命周期
+src/bridge.js      Android / Loopback Bridge 页面
+src/protocol.js    帧格式、编解码与协议常量
 src/mtproxy.js     MTProxy 握手、AES-CTR 转换和 Telegram DC 路由
 test/              单元测试
 wrangler.toml      Cloudflare Workers 配置
