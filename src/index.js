@@ -3,6 +3,8 @@ import { RelaySession } from "./session.js";
 import { FRAME, encodeFrame, parseFrames, clampInt } from "./protocol.js";
 import { bridgePage } from "./bridge.js";
 
+const SESSION_TOKEN_TTL_SECONDS = 600;
+
 export default {
   async fetch(request, env) {
     try {
@@ -13,10 +15,6 @@ export default {
     }
   },
 };
-
-export class WebProxySession extends RelaySession {
-  constructor(ctx, env) { super(ctx, env, connect); }
-}
 
 async function route(request, env) {
   const url = new URL(request.url);
@@ -37,8 +35,8 @@ async function route(request, env) {
     if (request.method === "DELETE") {
       const token = bearer(request);
       if (!(await verifySessionToken(env, expectedHost, token))) return camouflage();
-      const stub = env.SESSIONS.get(env.SESSIONS.idFromName(token));
-      await stub.fetch("https://session/internal/close", { method: "POST" });
+      // No Durable Object: the session lives in the Worker that holds the
+      // WebSocket and shuts itself down when that socket closes.
       return new Response(null, { status: 204, headers: noStore() });
     }
     if (request.method !== "POST" || !isBinary(request.headers.get("Content-Type"))) return camouflage();
@@ -48,14 +46,6 @@ async function route(request, env) {
     if (!isHello(hello)) return camouflage();
 
     const sessionToken = await createSessionToken(env, expectedHost);
-    const stub = env.SESSIONS.get(env.SESSIONS.idFromName(sessionToken));
-    const init = await stub.fetch("https://session/internal/init", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    });
-    if (!init.ok) return camouflage();
-
     const welcome = encodeFrame(FRAME.WELCOME, 0);
     return new Response(welcome, {
       status: 200,
@@ -74,10 +64,22 @@ async function route(request, env) {
     const protocol = protocols.find((v) => v.startsWith("tproxy-v1."));
     const token = protocol?.slice("tproxy-v1.".length);
     if (!(await verifySessionToken(env, expectedHost, token))) return camouflage();
-    const stub = env.SESSIONS.get(env.SESSIONS.idFromName(token));
-    return stub.fetch("https://session/internal/ws", {
+
+    // Run the relay session directly inside this Worker invocation. The open
+    // WebSocket keeps the isolate alive, so waitUntil only needs to swallow errors.
+    const ctx = {
+      waitUntil: (promise) => { Promise.resolve(promise).catch(() => {}); },
+      storage: {
+        get: async () => Date.now() + SESSION_TOKEN_TTL_SECONDS * 1000,
+        put: async () => {},
+        delete: async () => {},
+      },
+    };
+    const session = new RelaySession(ctx, env, connect);
+    session.initialized = true;
+    return session.fetch(new Request("https://session/internal/ws", {
       headers: { Upgrade: "websocket", "X-TProxy-Protocol": protocol },
-    });
+    }));
   }
 
   if (url.pathname === "/healthz" && request.method === "GET") {
@@ -144,12 +146,16 @@ async function hmac(keyBytes, data) {
   return new Uint8Array(await crypto.subtle.sign("HMAC", key, data));
 }
 
-// Keep the opaque 43-character wire format, but reject fabricated credentials
-// before they can allocate or address a Durable Object.
+// Stateless session token (43 base64url chars = 32 bytes):
+//   bytes 0..3   expiry (unix seconds, big-endian)
+//   bytes 4..15  random nonce
+//   bytes 16..31 truncated HMAC over bytes 0..15
+// Fabricated or expired credentials are rejected without any stored state.
 async function createSessionToken(env, host) {
-  const nonce = crypto.getRandomValues(new Uint8Array(16));
-  const mac = await sessionMac(env, host, nonce);
-  const bytes = new Uint8Array(32); bytes.set(nonce); bytes.set(mac.subarray(0, 16), 16);
+  const head = crypto.getRandomValues(new Uint8Array(16));
+  new DataView(head.buffer).setUint32(0, Math.floor(Date.now() / 1000) + SESSION_TOKEN_TTL_SECONDS);
+  const mac = await sessionMac(env, host, head);
+  const bytes = new Uint8Array(32); bytes.set(head); bytes.set(mac.subarray(0, 16), 16);
   return base64url(bytes);
 }
 async function verifySessionToken(env, host, token) {
@@ -157,7 +163,8 @@ async function verifySessionToken(env, host, token) {
   const bytes = base64urlDecode(token);
   if (base64url(bytes) !== token) return false;
   const mac = await sessionMac(env, host, bytes.subarray(0, 16));
-  return constantTimeEqual(base64url(bytes.subarray(16)), base64url(mac.subarray(0, 16)));
+  if (!constantTimeEqual(base64url(bytes.subarray(16)), base64url(mac.subarray(0, 16)))) return false;
+  return new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0) >= Math.floor(Date.now() / 1000);
 }
 function sessionMac(env, host, nonce) {
   const context = new TextEncoder().encode("cf-webproxy/session-token/v1\n" + host + "\n");
