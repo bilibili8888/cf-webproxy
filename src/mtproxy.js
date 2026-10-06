@@ -6,26 +6,23 @@ export class AesCtrStream {
     if (keyBytes.length !== 32 || ivBytes.length !== 16) throw new Error("bad AES material");
     this.keyPromise = crypto.subtle.importKey("raw", keyBytes, "AES-CTR", false, ["encrypt"]);
     this.counter = new Uint8Array(ivBytes);
-    this.spare = new Uint8Array();
+    this.offset = 0; // bytes already consumed inside the current 16-byte keystream block
   }
+  // Let the native AES-CTR encrypt the data directly (no JS XOR loop).
+  // Stream position is updated synchronously, so call order alone fixes the keystream position.
   async crypt(input) {
     const src = input instanceof Uint8Array ? input : new Uint8Array(input);
-    const out = new Uint8Array(src.length); let pos = 0;
-    if (this.spare.length) {
-      const n = Math.min(this.spare.length, src.length);
-      for (let i=0;i<n;i++) out[i] = src[i] ^ this.spare[i];
-      this.spare = this.spare.subarray(n); pos = n;
-    }
-    if (pos < src.length) {
-      const need = src.length - pos, blocks = Math.ceil(need / 16);
-      const zeros = new Uint8Array(blocks * 16);
-      const key = await this.keyPromise;
-      const ks = new Uint8Array(await crypto.subtle.encrypt({name:"AES-CTR",counter:this.counter,length:128}, key, zeros));
-      addBlocks(this.counter, blocks);
-      for (let i=0;i<need;i++) out[pos+i] = src[pos+i] ^ ks[i];
-      if (need < ks.length) this.spare = ks.subarray(need);
-    }
-    return out;
+    if (!src.length) return new Uint8Array();
+    const counter = this.counter.slice();
+    const offset = this.offset;
+    const total = offset + src.length;
+    addBlocks(this.counter, Math.floor(total / 16));
+    this.offset = total % 16;
+    let data = src;
+    if (offset) { data = new Uint8Array(total); data.set(src, offset); }
+    const key = await this.keyPromise;
+    const out = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CTR", counter, length: 128 }, key, data));
+    return offset ? out.subarray(offset) : out;
   }
 }
 
